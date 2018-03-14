@@ -29,7 +29,7 @@ use std::sync::Mutex;
 
 use proc_macro;
 #[cfg(feature = "unstable")]
-use proc_macro::TokenTree;
+use proc_macro::{Diagnostic, Level, TokenTree};
 use proc_macro2::{TokenNode, TokenStream};
 use quote::ToTokens;
 use syn::{
@@ -238,6 +238,7 @@ macro_rules! separated_by0 {
 
             match $submac!(input, $($args)*) {
                 ::std::result::Result::Err(_) => {
+                    println!("Error");
                     ret = ::std::result::Result::Ok((res, input));
                     break;
                 }
@@ -377,6 +378,54 @@ named! { path_or_ident -> PathOrIdent,
     })
 }
 
+macro_rules! error_expecting_braces {
+    ($i:expr,) => {{
+        let mut i = $i;
+        if let Some((token, _)) = i.token_tree() {
+            let expected = "`{`";
+            #[cfg(feature = "unstable")]
+            {
+                let diagnostic = Diagnostic::spanned(token.span().unstable(), Level::Error,
+                format!("Unexpected token `{}`, expecting {}", token, expected));
+                diagnostic.emit();
+            }
+            #[cfg(not(feature = "unstable"))]
+            panic!("Unexpected token `{}`, expecting {}", token, expected);
+        }
+        let gtk_widget = GtkWidget::new();
+        let typ: Path = parse(quote! { ::dummy }.into()).expect("path");
+        ::std::result::Result::Ok((ChildWidget(Widget::new_gtk(gtk_widget, typ, vec![], vec![], HashMap::new(),
+            HashMap::new(), HashMap::new())), $i))
+    }};
+}
+
+macro_rules! error_after_child_gtk_items {
+    ($i:expr,) => {{
+        let mut i = $i;
+        if let Some((token, tts)) = i.token_tree() {
+            i = tts;
+            let expected = "either `,` or one of gtk property, gtk event or child widget";
+            loop {
+                if i.eof() {
+                    break;
+                }
+                if let Some((_, tts)) = i.token_tree() {
+                    i = tts;
+                }
+            }
+            #[cfg(feature = "unstable")]
+            {
+                let diagnostic = Diagnostic::spanned(token.span().unstable(), Level::Error,
+                format!("Unexpected token `{}`, expecting {}", token, expected));
+                diagnostic.emit();
+            }
+            #[cfg(not(feature = "unstable"))]
+            panic!("Unexpected token `{}`, expecting {}", token, expected);
+        }
+        ::std::result::Result::Ok(((), i))
+    }};
+}
+
 named! { child_widget(root: SaveWidget) -> (ChildItem, Option<String>), do_parse!(
     attributes: map!(option!(attributes), |attributes| attributes.unwrap_or_else(HashMap::new)) >>
     typ: path_or_ident >>
@@ -401,45 +450,49 @@ named! { child_widget(root: SaveWidget) -> (ChildItem, Option<String>), do_parse
     )
 }
 
-named! { gtk_widget(typ: Path, save: bool) -> ChildItem, map!(do_parse!(
+named! { gtk_widget(typ: Path, save: bool) -> ChildItem, do_parse!(
         init_properties: init_properties >>
-        gtk_widget: braces!(do_parse!(
-            child_items: separated_by0!(punct!(,), call!(child_gtk_item)) >>
-            ({
-                let mut gtk_widget = GtkWidget::new();
-                gtk_widget.save = save;
-                let mut init_parameters = vec![];
-                let mut children = vec![];
-                let mut properties = HashMap::new();
-                let mut child_events = HashMap::new();
-                let mut child_properties = HashMap::new();
-                for item in child_items.into_iter() {
-                    match item {
-                        ChildEvent(event_name, child_name, event) => {
-                            let _ = child_events.insert((child_name, event_name), event);
-                        },
-                        ItemChildProperties(child_props) => {
-                            for (key, value) in child_props {
-                                child_properties.insert(key, value);
-                            }
-                        },
-                        ItemEvent(ident, event) => { let _ = gtk_widget.events.insert(ident, event); },
-                        ChildWidget(widget) => children.push(widget),
-                        Property(ident, value) => { let _ = properties.insert(ident, value.value); },
-                        RelmMsg(_, _) | RelmMsgEvent(_, _) => panic!("Unexpected relm msg in gtk widget"),
-                    }
-                }
-                match init_properties {
-                    ConstructProperties(construct_properties) => gtk_widget.construct_properties = construct_properties,
-                    InitParameters(init_params) => init_parameters = init_params,
-                    NoInitProperties => (),
-                }
-                ChildWidget(Widget::new_gtk(gtk_widget, typ, init_parameters, children, properties, child_properties,
-                                     child_events))
-            })
-        )) >>
+        gtk_widget: alt!
+            ( map!(braces!(do_parse!(
+                  child_items: separated_by0!(punct!(,), call!(child_gtk_item)) >>
+                  error_after_child_gtk_items!() >>
+                  ({
+                      let mut gtk_widget = GtkWidget::new();
+                      gtk_widget.save = save;
+                      let mut init_parameters = vec![];
+                      let mut children = vec![];
+                      let mut properties = HashMap::new();
+                      let mut child_events = HashMap::new();
+                      let mut child_properties = HashMap::new();
+                      for item in child_items.into_iter() {
+                          match item {
+                              ChildEvent(event_name, child_name, event) => {
+                                  let _ = child_events.insert((child_name, event_name), event);
+                              },
+                              ItemChildProperties(child_props) => {
+                                  for (key, value) in child_props {
+                                      child_properties.insert(key, value);
+                                  }
+                              },
+                              ItemEvent(ident, event) => { let _ = gtk_widget.events.insert(ident, event); },
+                              ChildWidget(widget) => children.push(widget),
+                              Property(ident, value) => { let _ = properties.insert(ident, value.value); },
+                              RelmMsg(_, _) | RelmMsgEvent(_, _) => panic!("Unexpected relm msg in gtk widget"),
+                          }
+                      }
+                      match init_properties {
+                          ConstructProperties(construct_properties) => gtk_widget.construct_properties = construct_properties,
+                          InitParameters(init_params) => init_parameters = init_params,
+                          NoInitProperties => (),
+                      }
+                      ChildWidget(Widget::new_gtk(gtk_widget, typ, init_parameters, children, properties, child_properties,
+                                                  child_events))
+                  })
+              )), |(_, widget)| widget)
+            | error_expecting_braces!()
+            ) >>
         (gtk_widget)
-        ), |(_, widget)| widget)
+        )
 }
 
 named! { child_relm_item -> ChildItem, alt!
